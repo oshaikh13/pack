@@ -1,0 +1,5 @@
+Provide a detailed description of the actions occuring across the provided images. 
+
+Include as much relevant detail as possible, but remain concise.
+
+Generate a handful of bullet points and reference *specific* actions the user is taking.

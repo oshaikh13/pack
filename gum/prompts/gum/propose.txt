@@ -1,0 +1,75 @@
+You are a helpful assistant tasked with analyzing user behavior.
+
+# Analysis
+
+Using a transcription of user activity, analyze {user_name}'s current activities, behavior, and preferences. Draw insightful conclusions.
+
+Consider these points in your analysis:
+
+- What specific tasks or goals is {user_name} actively working towards according to these transcripts?
+- What applications or content does {user_name} clearly prefer engaging with?
+- What does {user_name} deliberately choose to ignore or deprioritize, and what might this imply about their priorities?
+- What are the clear strengths or weaknesses in {user_name}'s approach or interactions?
+
+Provide detailed explanations for each inference, explicitly citing relevant applications, content, or interactions from the transcriptions to substantiate your claims.
+
+## Evaluation Criteria
+
+For each proposition you generate, evaluate its strength based on two scales:
+
+### 1. Confidence Scale
+
+Evaluate your confidence in the proposition based on the explicitness and relevance of evidence from the provided transcripts. Consider the following factors:
+
+- **Direct Evidence**: Is the proposition explicitly supported by direct quotes or clear interactions in the transcript?
+- **Clarity and Relevance**: Is the evidence clearly related and relevant to the proposition?
+- **Completeness of Evidence**: Are there any critical details missing that weaken the support?
+- **Engagement Level**: Does the transcript clearly indicate active and meaningful engagement (as opposed to superficial interactions or brief mentions)?
+
+Use a scale from **1 to 10**, where:
+
+- **1**: Proposition is only weakly supported or relies heavily on assumptions.
+- **10**: Proposition is explicitly stated or clearly demonstrated through strong, direct, and relevant evidence.
+
+Be conservative: High confidence scores (8-10) require direct, explicit evidence from the transcriptions of meaningful user engagement.
+
+### 2. Decay Scale (Relevance Over Time)
+
+Evaluate how long the proposition remains relevant. Consider these factors:
+
+- **Immediacy**: Does the task or preference depend on immediate action or short-term deadlines?
+- **Durability**: Will the proposition remain relevant or valuable beyond the immediate timeframe?
+- **Time Sensitivity**: Is the inferred activity or behavior urgent or quickly obsolete if not addressed?
+
+Use a scale from **1 to 10**, where:
+
+- **1**: Proposition will become irrelevant almost immediately.
+- **10**: Proposition will remain relevant even if revisited 24 hours later or longer.
+
+# Input
+
+Below is a set of transcribed actions and interactions that {user_name} has performed on their computer:
+
+## User Activity Transcriptions
+
+{inputs}
+
+# Task
+
+Generate **5 distinct propositions** about {user_name}, covering a range of confidence levels. Ensure clarity, specificity, and detailed support from the transcripts for each proposition.
+
+Be direct, honest, and candid.
+
+Return your analysis strictly in the following JSON format:
+
+{
+  "propositions": [
+    {
+      "proposition": "[Insert your proposition here]",
+      "reasoning": "[Provide detailed evidence from specific parts of the transcriptions to clearly justify this proposition.]",
+      "confidence": "[Confidence score (1–10)]",
+      "decay": "[Decay score (1–10)]"
+    },
+    ...
+  ]
+}
