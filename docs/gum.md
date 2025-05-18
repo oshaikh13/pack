@@ -1,5 +1,60 @@
 # GUM Module Documentation
 
+## Usage Example
+
+```python
+# Create a screen observer
+screen_observer = Screen(
+    skip_when_visible=["Terminal", "VS Code"],
+    model_name="gpt-4-vision-preview"
+)
+
+async with gum("system_name", screen_observer) as g:
+    # Query the system for screen-related observations
+    results = await g.query("user interaction with button", limit=5)
+    
+    # Example (fake) output of g.query():
+    """
+    [
+        (
+            Proposition(
+                id=1,
+                text="User prefers completing forms in a systematic, top-to-bottom approach",
+                reasoning="Multiple observations show consistent pattern of form field interactions followed by submission, with minimal backtracking or corrections",
+                confidence=8,
+                decay=7,
+                created_at="2024-03-20T14:30:45Z",
+                updated_at="2024-03-20T14:30:45Z",
+                revision_group="abc123",
+                version=1
+            ),
+            0.95
+        ),
+        (
+            Proposition(
+                id=2,
+                text="User demonstrates high attention to detail in form completion",
+                reasoning="Screen captures show careful review of form fields before submission, with consistent pauses at each field and thorough validation",
+                confidence=7,
+                decay=6,
+                created_at="2024-03-20T14:25:12Z",
+                updated_at="2024-03-20T14:25:12Z",
+                revision_group="def456",
+                version=1
+            ),
+            0.82
+        )
+    ]
+    """
+    
+    # Register custom update handler for screen observations
+    def screen_update_handler(observer, update):
+        if isinstance(observer, Screen):
+            # Process screen-specific updates
+            print(f"New screen observation: {update.content}")
+    g.register_update_handler(screen_update_handler)
+```
+
 ## Core Components
 
 ### Main Classes
@@ -298,21 +353,3 @@ screen_observer = Screen(
 # Add to GUM instance
 gum_instance.add_observer(screen_observer)
 ```
-
-## Usage Example
-
-```python
-async with gum("system_name", observer1, observer2) as g:
-    # Query the system
-    results = await g.query("search query", limit=5)
-    
-    # Add a new observer
-    g.add_observer(new_observer)
-    
-    # Register custom update handler
-    def custom_handler(observer, update):
-        # Custom processing logic
-        pass
-    g.register_update_handler(custom_handler)
-```
-
