@@ -32,7 +32,6 @@ from .schemas import (
     AuditSchema
 )
 
-client = AsyncOpenAI()
 
 class gum:
     def __init__(
@@ -50,6 +49,8 @@ class gum:
         audit_enabled: bool = False,
     ):
         # basic paths
+        self.client = AsyncOpenAI()
+
         data_directory = os.path.expanduser(data_directory)
         os.makedirs(data_directory, exist_ok=True)
 
@@ -156,7 +157,7 @@ class gum:
         )
 
         schema = PropositionSchema.model_json_schema()
-        rsp = await client.chat.completions.create(
+        rsp = await self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             response_format=get_schema(schema),
@@ -184,7 +185,7 @@ class gum:
         ]
         prompt_text = await self._build_relation_prompt(payload)
 
-        rsp = await client.chat.completions.create(
+        rsp = await self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt_text}],
             response_format=get_schema(RelationSchema.model_json_schema()),
@@ -237,7 +238,7 @@ class gum:
     ) -> list[dict]:
         body = await self._build_revision_body(similar_cluster, related_obs)
         prompt = self.revise_prompt.replace("{body}", body)
-        rsp = await client.chat.completions.create(
+        rsp = await self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             response_format=get_schema(PropositionSchema.model_json_schema()), 
@@ -370,7 +371,7 @@ class gum:
             .replace("{user_name}", self.user_name)
         )
 
-        rsp = await client.chat.completions.create(
+        rsp = await self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             response_format=get_schema(AuditSchema.model_json_schema()),

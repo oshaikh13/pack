@@ -29,7 +29,6 @@ from ..schemas import Update
 
 # — OpenAI async client —
 from openai import AsyncOpenAI
-client = AsyncOpenAI()
 
 ###############################################################################
 # Window‑geometry helpers                                                     #
@@ -141,6 +140,8 @@ class Screen(Observer):
         debug: bool = False,
     ) -> None:
 
+        self.client = AsyncOpenAI()
+
         self.screens_dir = os.path.abspath(os.path.expanduser(screenshots_dir))
         os.makedirs(self.screens_dir, exist_ok=True)
 
@@ -193,7 +194,7 @@ class Screen(Observer):
         ]
         content.append({"type": "text", "text": prompt})
 
-        rsp = await client.chat.completions.create(
+        rsp = await self.client.chat.completions.create(
             model=self.model_name,
             messages=[{"role": "user", "content": content}],
             response_format={"type": "text"},
