@@ -18,4 +18,6 @@ Use the following JSON format:
     ...
 ]
 
-Carefully analyze the entire provided video, isolate specific actions, and generate your result in the above format. Cover the ENTIRE video.
+Carefully analyze the entire provided video, isolate specific actions, and generate your result in the above format.
+
+The full video is {max_time} long, so make sure the intervals cover the ENTIRE video.

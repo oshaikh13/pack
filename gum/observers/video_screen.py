@@ -39,9 +39,9 @@ class VideoScreen(Observer):
     """
 
     # ----------------------------- tuning knobs -----------------------------
-    _CAPTURE_FPS: int = 10              # live “before‑frame” refresh rate
+    _CAPTURE_FPS: int = 10              # live "before-frame" refresh rate
     _DEBOUNCE_SEC: int = 1              # wait this long after an event
-    _MON_START: int = 1                 # first real display in mss’ list
+    _MON_START: int = 1                 # first real display in mss' list
 
     _SCREENSHOTS_PER_VIDEO: int = 10    # stitch when this many frames queued
     _SECONDS_PER_SCREENSHOT: int = 1    # still frame duration inside clip
@@ -50,8 +50,9 @@ class VideoScreen(Observer):
     def __init__(
         self,
         screenshots_dir: str = "~/.cache/gum/screenshots",
+        keystrokes_file: str = "~/.cache/gum/keystrokes.jsonl",
         skip_when_visible: Optional[str | list[str]] = None,
-        transcription_prompt: str = "Describe what is happening on‑screen.",
+        transcription_prompt: str = None,
         history_k: int = 10,
         debug: bool = False,
     ) -> None:
@@ -62,7 +63,6 @@ class VideoScreen(Observer):
 
         # guard list --------------------------------------------------------
         self._guard = {skip_when_visible} if isinstance(skip_when_visible, str) else set(skip_when_visible or [])
-
         self.transcription_prompt = transcription_prompt or self._load_prompt("dense_caption.txt")
         self.debug = debug
 
@@ -113,61 +113,60 @@ class VideoScreen(Observer):
         return await asyncio.to_thread(_build)
 
     def _call_gemini(self, prompt: str, video_path: str) -> str:
-        """Synchronous Google GenAI call wrapped in `to_thread`."""
-        print("CALLING GEMINI")
-        def _sync_call() -> str:
-            print("GENERATING CONFIG")
-            generate_content_config = genai.types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=genai.types.Schema(
-                    type = genai.types.Type.OBJECT,
-                    required = ["transcriptions"],
-                    properties = {
-                        "transcriptions": genai.types.Schema(
-                            type = genai.types.Type.ARRAY,
-                            items = genai.types.Schema(
-                                type = genai.types.Type.OBJECT,
-                                required = ["caption", "timestamp"],
-                                properties = {
-                                    "caption": genai.types.Schema(
-                                        type = genai.types.Type.STRING,
-                                    ),
-                                    "timestamp": genai.types.Schema(
-                                        type = genai.types.Type.STRING,
-                                    ),
-                                },
-                            ),
+        generate_content_config = genai.types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=genai.types.Schema(
+                type = genai.types.Type.OBJECT,
+                required = ["transcriptions"],
+                properties = {
+                    "transcriptions": genai.types.Schema(
+                        type = genai.types.Type.ARRAY,
+                        items = genai.types.Schema(
+                            type = genai.types.Type.OBJECT,
+                            required = ["caption", "timestamp"],
+                            properties = {
+                                "caption": genai.types.Schema(
+                                    type = genai.types.Type.STRING,
+                                ),
+                                "timestamp": genai.types.Schema(
+                                    type = genai.types.Type.STRING,
+                                ),
+                            },
                         ),
-                    },
-                ),
-            )
+                    ),
+                },
+            ),
+        )
 
-            client   = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        client   = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-            with open(video_path, "rb") as f:
-                video_bytes = f.read()
+        with open(video_path, "rb") as f:
+            video_bytes = f.read()
 
-            resp = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=genai_types.Content(
-                    parts=[
-                        genai_types.Part(
-                            inline_data=genai_types.Blob(
-                                data=video_bytes,
-                                mime_type="video/mp4"
-                            )
-                        ),
-                        genai_types.Part(
-                            text=self.transcription_prompt
-                        ),
-                    ]
-                ),
-                config=generate_content_config,
-            )
+        total_seconds = self._SCREENSHOTS_PER_VIDEO * self._SECONDS_PER_SCREENSHOT
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        curr_prompt = prompt.replace("{max_time}", f"{minutes:02d}:{seconds:02d}")
 
-            return resp.text
+        resp = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=genai_types.Content(
+                parts=[
+                    genai_types.Part(
+                        inline_data=genai_types.Blob(
+                            data=video_bytes,
+                            mime_type="video/mp4"
+                        )
+                    ),
+                    genai_types.Part(
+                        text=curr_prompt
+                    ),
+                ]
+            ),
+            config=generate_content_config,
+        )
 
-        return _sync_call()
+        return resp.text
 
     # --------------------------- processing logic --------------------------
     async def _maybe_flush_video(self) -> None:
@@ -257,7 +256,7 @@ class VideoScreen(Observer):
 
                 await self._process_event(bef_path, aft_path)
 
-                log.info(f"{ev['type']} captured on monitor {ev['mon']}\\n")
+                log.info(f"{ev['type']} captured on monitor {ev['mon']}\n")
                 self._pending_event = None
 
             def debounce_flush():
@@ -272,7 +271,7 @@ class VideoScreen(Observer):
                 if self._skip() or idx is None:
                     return
 
-                # lazily grab before‑frame
+                # lazily grab before-frame
                 if self._pending_event is None:
                     async with self._frame_lock:
                         bf = self._frames.get(idx)
