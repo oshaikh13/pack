@@ -1,416 +1,351 @@
-# frame_screen.py
 from __future__ import annotations
 ###############################################################################
 # Imports                                                                     #
 ###############################################################################
 
-from dotenv import load_dotenv
-load_dotenv()
-
-# ─ Standard library ──────────────────────────────────────────────────────────
-import asyncio
-import json
+# — Standard library —
+import base64
 import logging
 import os
-import shlex
-import subprocess
-import tempfile
 import time
-from datetime import timedelta
+from collections import deque
 from importlib.resources import files as get_package_file
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
-# ─ Third-party ───────────────────────────────────────────────────────────────
+import asyncio
+from functools import partial
+
+# — Third-party —
 import mss
+import Quartz
 from PIL import Image
-from pynput import mouse, keyboard
-from google import genai
-from google.genai import types as gtypes
+from pynput import mouse           # still synchronous
+from shapely.geometry import box
+from shapely.ops import unary_union
 
-# ─ Local (adjust the import paths to match your project layout) ──────────────
-from .observer import Observer           # your existing base-class
-from .window_geometry import is_app_visible
-from ..schemas import Update             # whatever you already use
+# — Local —
+from .observer import Observer
+from ..schemas import Update
+
+# — OpenAI async client —
+from openai import AsyncOpenAI
 
 ###############################################################################
-# Helper functions                                                            #
+# Window‑geometry helpers                                                     #
 ###############################################################################
 
-def _sec_to_mmss(sec: float) -> str:
-    mins, secs = divmod(int(sec), 60)
-    return f"{mins:02d}:{secs:02d}"
 
+def _get_global_bounds() -> tuple[float, float, float, float]:
+    """Return a bounding box enclosing **all** physical displays.
 
-def _build_video_ffmpeg(jpg_paths: list[str], out_path: str,
-                        fps: int = 1, crf: int = 28, preset: str = "veryfast") -> None:
+    Returns
+    -------
+    (min_x, min_y, max_x, max_y) tuple in Quartz global coordinates.
     """
-    JPEG → MP4 with ffmpeg concat (libx264, yuv420p) @ *fps*.
-    """
-    txtfile = out_path + ".list"
-    with open(txtfile, "w") as fh:
-        for p in jpg_paths:
-            fh.write(f"file '{p}'\n")
+    err, ids, cnt = Quartz.CGGetActiveDisplayList(16, None, None)
+    if err != Quartz.kCGErrorSuccess:  # pragma: no cover (defensive)
+        raise OSError(f"CGGetActiveDisplayList failed: {err}")
 
-    cmd = (
-        f"ffmpeg -y -r {fps} -f concat -safe 0 -i {txtfile} "
-        f"-c:v libx264 -pix_fmt yuv420p -crf {crf} -preset {preset} {out_path}"
+    min_x = min_y = float("inf")
+    max_x = max_y = -float("inf")
+    for did in ids[:cnt]:
+        r = Quartz.CGDisplayBounds(did)
+        x0, y0 = r.origin.x, r.origin.y
+        x1, y1 = x0 + r.size.width, y0 + r.size.height
+        min_x, min_y = min(min_x, x0), min(min_y, y0)
+        max_x, max_y = max(max_x, x1), max(max_y, y1)
+    return min_x, min_y, max_x, max_y
+
+
+def _get_visible_windows() -> List[tuple[dict, float]]:
+    """List *onscreen* windows with their visible‑area ratio.
+
+    Each tuple is ``(window_info_dict, visible_ratio)`` where *visible_ratio*
+    is in ``[0.0, 1.0]``.  Internal system windows (Dock, WindowServer, …) are
+    ignored.
+    """
+    _, _, _, gmax_y = _get_global_bounds()
+
+    opts = (
+        Quartz.kCGWindowListOptionOnScreenOnly
+        | Quartz.kCGWindowListOptionIncludingWindow
     )
-    subprocess.run(shlex.split(cmd), check=True)
-    os.remove(txtfile)
+    wins = Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID)
+
+    occupied = None  # running union of opaque regions above the current window
+    result: list[tuple[dict, float]] = []
+
+    for info in wins:
+        owner = info.get("kCGWindowOwnerName", "")
+        if owner in ("Dock", "WindowServer", "Window Server"):
+            continue
+
+        bounds = info.get("kCGWindowBounds", {})
+        x, y, w, h = (
+            bounds.get("X", 0),
+            bounds.get("Y", 0),
+            bounds.get("Width", 0),
+            bounds.get("Height", 0),
+        )
+        if w <= 0 or h <= 0:
+            continue  # hidden or minimised
+
+        inv_y = gmax_y - y - h  # Quartz→Shapely Y‑flip
+        poly = box(x, inv_y, x + w, inv_y + h)
+        if poly.is_empty:
+            continue
+
+        visible = poly if occupied is None else poly.difference(occupied)
+        if not visible.is_empty:
+            ratio = visible.area / poly.area
+            result.append((info, ratio))
+            occupied = poly if occupied is None else unary_union([occupied, poly])
+
+    return result
+
+
+def _is_app_visible(names: Iterable[str]) -> bool:
+    """Return *True* if **any** window from *names* is at least partially visible."""
+    targets = set(names)
+    return any(
+        info.get("kCGWindowOwnerName", "") in targets and ratio > 0
+        for info, ratio in _get_visible_windows()
+    )
 
 ###############################################################################
-# Realtime screen & keystroke observer                                        #
+# Screen observer                                                             #
 ###############################################################################
 
-class FrameScreen(Observer):
-    """Capture screen frames + low-latency input-events, periodically emit
-    a 1 fps compressed MP4 and ask Gemini for dense captions.
+class Screen(Observer):
+    """
+    Capture before/after screenshots around user interactions.
+    Blocking work (Quartz, mss, Pillow, OpenAI Vision) is executed in
+    background threads via `asyncio.to_thread`.
     """
 
-    # ────────────── runtime knobs
-    _CAPTURE_FPS: int = 10              # refresh live frame buffers
-    _MOVE_IDLE_SEC: float = 0.35        # idle gap ending a "move" gesture
-    _SCROLL_IDLE_SEC: float = 0.35      # idle gap ending a "scroll" gesture
-    _FRAME_IDLE_SEC: float = 1.00       # idle gap before we snapshot screen
+    _CAPTURE_FPS: int = 10
+    _PERIODIC_SEC: int = 30
+    _DEBOUNCE_SEC: int = 3
+    _MON_START: int = 1     # first real display in mss
 
-    _MON_START: int = 1                 # first real display in mss.monitors
-    _VIDEO_INTERVAL_SEC: int = 30       # flush when buffer ≥ this
-    _VIDEO_FPS: int = 1                 # constructed video fps
-    _VIDEO_CRF: int = 28                # ffmpeg compression (lower → bigger)
-    _VIDEO_PRESET: str = "veryfast"     # ffmpeg speed / compression trade-off
-
-    # ───────────────────────── construction
+    # ─────────────────────────────── construction
     def __init__(
         self,
         screenshots_dir: str = "~/.cache/gum/screenshots",
-        keystrokes_path: str = "~/.cache/gum/keystrokes.log",  # JSONL
         skip_when_visible: Optional[str | list[str]] = None,
+        transcription_prompt: Optional[str] = None,
+        summary_prompt: Optional[str] = None,
+        model_name: str = "gpt-4o-mini",
+        history_k: int = 10,
         debug: bool = False,
     ) -> None:
 
-        # screenshot output directory
+        self.client = AsyncOpenAI()
+
         self.screens_dir = os.path.abspath(os.path.expanduser(screenshots_dir))
         os.makedirs(self.screens_dir, exist_ok=True)
 
-        # low-latency input-event log (JSONL)
-        self.keystrokes_path = os.path.abspath(os.path.expanduser(keystrokes_path))
-        os.makedirs(os.path.dirname(self.keystrokes_path), exist_ok=True)
-        self._keys_fh = open(self.keystrokes_path, "a", buffering=1)
-
-        # pause capture if any window in *guard* set is visible
         self._guard = {skip_when_visible} if isinstance(skip_when_visible, str) else set(skip_when_visible or [])
+
+        self.transcription_prompt = transcription_prompt or self._load_prompt("transcribe.txt")
+        self.summary_prompt       = summary_prompt       or self._load_prompt("summarize.txt")
+        self.model_name = model_name
+
         self.debug = debug
 
-        # per-monitor live frame buffers
+        # state shared with worker
         self._frames: Dict[int, Any] = {}
         self._frame_lock = asyncio.Lock()
 
-        # mouse-press bookkeeping (down→up duration)
-        self._press_state: Optional[dict] = None
-        self._button_pressed: Optional[str] = None
+        self._history: deque[str] = deque(maxlen=max(0, history_k))
+        self._pending_event: Optional[dict] = None
+        self._debounce_handle: Optional[asyncio.TimerHandle] = None
 
-        # debounced gesture state/handles
-        self._move_state: Optional[dict] = None
-        self._move_handle: Optional[asyncio.TimerHandle] = None
-        self._scroll_state: Optional[dict] = None
-        self._scroll_handle: Optional[asyncio.TimerHandle] = None
-
-        # debounced screenshot handle
-        self._shot_handle: Optional[asyncio.TimerHandle] = None
-
-        # dense caption base-prompt
-        self._dense_caption_prompt = self._load_prompt("dense_caption.txt")
-
-        # video-flush buffer
-        self._video_buf: list[tuple[float, str]] = []      # [(abs_ts, jpg_path)…]
-        self._last_video_start: float | None = None
-
+        # call parent
         super().__init__()
 
-    # ───────────────────────── prompt loader
+    # ─────────────────────────────── tiny sync helpers
     @staticmethod
     def _load_prompt(fname: str) -> str:
         return get_package_file("gum.prompts.screen").joinpath(fname).read_text()
 
-    # ───────────────────────── misc helpers
-    def _skip(self) -> bool:
-        """True if we should pause because a guarded window is visible."""
-        return is_app_visible(self._guard) if self._guard else False
+    @staticmethod
+    def _mon_for(x: float, y: float, mons: list[dict]) -> Optional[int]:
+        for idx, m in enumerate(mons, 1):
+            if m["left"] <= x < m["left"] + m["width"] and m["top"] <= y < m["top"] + m["height"]:
+                return idx
+        return None
 
-    def _reset_timer(self, attr: str, delay: float, coro):
-        """Cancel any existing timer stored at *attr* and start a new one."""
-        loop = asyncio.get_running_loop()
-        if (h := getattr(self, attr)):
-            h.cancel()
-        setattr(self, attr, loop.call_later(delay, lambda: asyncio.create_task(coro())))
+    @staticmethod
+    def _encode_image(img_path: str) -> str:
+        with open(img_path, "rb") as fh:
+            return base64.b64encode(fh.read()).decode()
 
-    # ───────────────────────── screenshot + buffering
+    # ─────────────────────────────── OpenAI Vision (async)
+    async def _call_gpt_vision(self, prompt: str, img_paths: list[str]) -> str:
+        content = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+            }
+            for encoded in (await asyncio.gather(
+                *[asyncio.to_thread(self._encode_image, p) for p in img_paths]
+            ))
+        ]
+        content.append({"type": "text", "text": prompt})
+
+        rsp = await self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": content}],
+            response_format={"type": "text"},
+        )
+        return rsp.choices[0].message.content
+
+    # ─────────────────────────────── I/O helpers
     async def _save_frame(self, frame, tag: str) -> str:
-        ts = time.time()
-        path = os.path.join(self.screens_dir, f"{ts:.5f}_{tag}.jpg")
+        ts   = f"{time.time():.5f}"
+        path = os.path.join(self.screens_dir, f"{ts}_{tag}.jpg")
         await asyncio.to_thread(
             Image.frombytes("RGB", (frame.width, frame.height), frame.rgb).save,
-            path, "JPEG", quality=90,
+            path,
+            "JPEG",
+            quality=90,
         )
-
-        # ─── push to video buffer ───
-        self._video_buf.append((ts, path))
-        if self._last_video_start is None:
-            self._last_video_start = ts
-
-        if ts - self._last_video_start >= self._VIDEO_INTERVAL_SEC:
-            buf_copy = self._video_buf[:]
-            self._video_buf.clear()
-            self._last_video_start = None
-            asyncio.create_task(self._finalize_video(buf_copy))
-
         return path
 
-    # ───────────────────────── key/gesture logging
-    async def _log_event(self, etype: str, payload: dict) -> None:
-        event = {"ts": time.time(), "type": etype, **payload}
-        line = json.dumps(event, separators=(",", ":")) + "\n"
-        await asyncio.to_thread(self._keys_fh.write, line)
-        await asyncio.to_thread(self._keys_fh.flush)
-        await self.update_queue.put(Update(content=line.rstrip(), content_type="input_text"))
+    async def _process_and_emit(self, before_path: str, after_path: str | None) -> None:
+        # chronology: append 'before' first (history order == real order)
+        self._history.append(before_path)
+        prev_paths = list(self._history)
 
-    # ───────────────────────── video → gemini worker
-    async def _finalize_video(self, frames: list[tuple[float, str]]) -> None:
-        """Build MP4, craft prompt, ask Gemini, emit JSON."""
-        if not frames:
-            return
-        t0, t1 = frames[0][0], frames[-1][0]
+        # async OpenAI calls
+        try:
+            transcription = await self._call_gpt_vision(self.transcription_prompt, [before_path])
+        except Exception as exc:                                        # pragma: no cover
+            transcription = f"[transcription failed: {exc}]"
 
-        # 1. Build compressed MP4 ------------------------------------------------
-        tmp_mp4 = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-        await asyncio.to_thread(
-            _build_video_ffmpeg,
-            [p for _, p in frames],
-            tmp_mp4,
-            self._VIDEO_FPS,
-            self._VIDEO_CRF,
-            self._VIDEO_PRESET,
-        )
+        summary = ""
+        if after_path:
+            prev_paths.append(after_path)
+            try:
+                summary = await self._call_gpt_vision(self.summary_prompt, prev_paths)
+            except Exception as exc:                                    # pragma: no cover
+                summary = f"[summary failed: {exc}]"
 
-        # 2. Collect keystrokes within window -----------------------------------
-        keys_between: list[str] = []
-        with open(self.keystrokes_path) as fh:
-            for line in fh:
-                ev = json.loads(line)
-                if t0 <= ev["ts"] <= t1:
-                    rel = _sec_to_mmss(ev["ts"] - t0)
-                    keys_between.append(f"{rel} {ev['type']} {ev.get('key','')}")
+        txt = (transcription + summary).strip()
+        await self.update_queue.put(Update(content=txt, content_type="input_text"))
 
-        # 3. Craft dense-caption prompt -----------------------------------------
-        prompt_txt = self._dense_caption_prompt.replace(
-            "{keystrokes}", "\n".join(keys_between)
-        )
+    # ─────────────────────────────── skip guard
+    def _skip(self) -> bool:
+        return _is_app_visible(self._guard) if self._guard else False
 
-        # 4. Ask Gemini ----------------------------------------------------------
-        client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-        vid_file = client.files.upload(file=tmp_mp4)
-
-        cfg = gtypes.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=gtypes.Schema(
-                type=gtypes.Type.OBJECT,
-                properties={
-                    "timestamp": gtypes.Schema(type=gtypes.Type.STRING),
-                    "caption":   gtypes.Schema(type=gtypes.Type.STRING),
-                },
-            ),
-        )
-
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[vid_file, prompt_txt],
-            config=cfg,
-        )
-
-        # 5. Emit caption JSON downstream ---------------------------------------
-        await self.update_queue.put(Update(content=resp.text, content_type="application/json"))
-
-        # Cleanup
-        os.remove(tmp_mp4)
-
-    # ────────────────────────── main async worker (unchanged except for calls)
-    async def _worker(self) -> None:
+    # ─────────────────────────────── main async worker
+    async def _worker(self) -> None:          # overrides base class
         log = logging.getLogger("Screen")
         if self.debug:
-            logging.basicConfig(level=logging.INFO,
-                                format="%(asctime)s [Screen] %(message)s",
-                                datefmt="%H:%M:%S")
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s [Screen] %(message)s", datefmt="%H:%M:%S")
         else:
             log.addHandler(logging.NullHandler())
             log.propagate = False
 
+        CAP_FPS  = self._CAPTURE_FPS
+        PERIOD   = self._PERIODIC_SEC
+        DEBOUNCE = self._DEBOUNCE_SEC
+
         loop = asyncio.get_running_loop()
 
+        # ------------------------------------------------------------------
+        # All calls to mss / Quartz are wrapped in `to_thread`
+        # ------------------------------------------------------------------
         with mss.mss() as sct:
             mons = sct.monitors[self._MON_START:]
 
-            # ─── OS-thread → asyncio trampolines ───
-            mouse_listener = mouse.Listener(
-                on_click=lambda x, y, btn, prs: asyncio.run_coroutine_threadsafe(
-                    mouse_click(x, y, btn, prs), loop),
-                on_move=lambda x, y: asyncio.run_coroutine_threadsafe(
-                    mouse_move(x, y), loop),
-                on_scroll=lambda x, y, dx, dy: asyncio.run_coroutine_threadsafe(
-                    mouse_scroll(x, y, dx, dy), loop),
+            # ---- mouse callbacks (pynput is sync → schedule into loop) ----
+            def schedule_event(x: float, y: float, typ: str):
+                asyncio.run_coroutine_threadsafe(mouse_event(x, y, typ), loop)
+
+            listener = mouse.Listener(
+                on_move=lambda x, y: schedule_event(x, y, "move"),
+                on_click=lambda x, y, btn, prs: schedule_event(x, y, "click") if prs else None,
+                on_scroll=lambda x, y, dx, dy: schedule_event(x, y, "scroll"),
             )
-            mouse_listener.start()
+            listener.start()
 
-            keyboard_listener = keyboard.Listener(
-                on_press=lambda k: asyncio.run_coroutine_threadsafe(key_event(k, True), loop),
-                on_release=lambda k: asyncio.run_coroutine_threadsafe(key_event(k, False), loop),
-            )
-            keyboard_listener.start()
-
-            # ─── flush helpers for debounced gestures ───
-            async def flush_move():
-                if self._move_state and not self._skip():
-                    ms = self._move_state
-                    await self._log_event(
-                        "mouse_move",
-                        {
-                            "sx": ms["sx"], "sy": ms["sy"],
-                            "ex": ms["ex"], "ey": ms["ey"],
-                            "mon": ms["mon"],
-                            "dt": ms["end"] - ms["start"],
-                            **({"button": ms["button"]} if ms["button"] else {}),
-                        },
-                    )
-                    self._schedule_screenshot(ms["mon"], sct, mons)
-                self._move_state = None
-
-            async def flush_scroll():
-                if self._scroll_state and not self._skip():
-                    ss = self._scroll_state
-                    await self._log_event(
-                        "mouse_scroll",
-                        {
-                            "sx": ss["sx"], "sy": ss["sy"],
-                            "ex": ss["ex"], "ey": ss["ey"],
-                            "dx": ss["dx"], "dy": ss["dy"],
-                            "mon": ss["mon"],
-                            "dt": ss["end"] - ss["start"],
-                        },
-                    )
-                    self._schedule_screenshot(ss["mon"], sct, mons)
-                self._scroll_state = None
-
-            # ─── mouse event coroutines ───
-            async def mouse_move(x: float, y: float):
-                idx = self._mon_for(x, y, mons)
-                if self._skip() or idx is None:
+            # ---- nested helper inside the async context ----
+            async def flush():
+                if self._pending_event is None:
                     return
-
-                now = time.time()
-                if self._move_state is None:
-                    self._move_state = {
-                        "sx": x, "sy": y, "ex": x, "ey": y,
-                        "start": now, "end": now,
-                        "mon": idx,
-                        "button": self._button_pressed,
-                    }
-                else:
-                    self._move_state.update({"ex": x, "ey": y, "end": now})
-
-                self._reset_timer("_move_handle", self._MOVE_IDLE_SEC, flush_move)
-
-            async def mouse_scroll(x: float, y: float, dx: int, dy: int):
-                idx = self._mon_for(x, y, mons)
-                if self._skip() or idx is None:
-                    return
-
-                now = time.time()
-                if self._scroll_state is None:
-                    self._scroll_state = {
-                        "sx": x, "sy": y, "ex": x, "ey": y,
-                        "dx": dx, "dy": dy,
-                        "start": now, "end": now,
-                        "mon": idx,
-                    }
-                else:
-                    self._scroll_state.update({
-                        "ex": x, "ey": y,
-                        "dx": self._scroll_state["dx"] + dx,
-                        "dy": self._scroll_state["dy"] + dy,
-                        "end": now,
-                    })
-
-                self._reset_timer("_scroll_handle", self._SCROLL_IDLE_SEC, flush_scroll)
-
-            async def mouse_click(x: float, y: float, btn: mouse.Button, pressed: bool):
-                button_name = (
-                    "left" if btn == mouse.Button.left
-                    else "right" if btn == mouse.Button.right
-                    else "middle"
-                )
-                idx = self._mon_for(x, y, mons)
-                if self._skip() or idx is None:
-                    return
-
-                if pressed:
-                    # mouse DOWN — duration bookkeeping only
-                    self._press_state = {
-                        "button": button_name, "x": x, "y": y,
-                        "mon": idx, "ts": time.time(),
-                    }
-                    self._button_pressed = button_name
-                else:
-                    # mouse UP — log + schedule screenshot after debounce
-                    self._button_pressed = None
-                    dt = 0.0
-                    if self._press_state and self._press_state["button"] == button_name:
-                        dt = time.time() - self._press_state["ts"]
-                    await self._log_event(
-                        "mouse_click",
-                        {"button": button_name, "x": x, "y": y, "mon": idx, "dt": dt},
-                    )
-                    self._schedule_screenshot(idx, sct, mons)
-                    self._press_state = None
-
-            # ─── key event coroutine ───
-            async def key_event(k, is_down: bool):
                 if self._skip():
+                    self._pending_event = None
                     return
-                try:
-                    k_str = k.char if hasattr(k, "char") else str(k)
-                except Exception:
-                    k_str = str(k)
-                await self._log_event("key_down" if is_down else "key_up", {"key": k_str})
 
-            # ─── helper for delayed screenshots ───
-            def _schedule_screenshot(idx: int, sct_: mss.mss, mons_: list[dict]):
-                async def take_shot():
-                    if self._skip():
+                ev = self._pending_event
+                aft = await asyncio.to_thread(sct.grab, mons[ev["mon"] - 1])
+
+                bef_path = await self._save_frame(ev["before"], "before")
+                aft_path = await self._save_frame(aft, "after")
+                await self._process_and_emit(bef_path, aft_path)
+
+                log.info(f"{ev['type']} captured on monitor {ev['mon']}")
+                self._pending_event = None
+
+            def debounce_flush():
+                # callback from loop.call_later → must create task
+                asyncio.create_task(flush())
+
+            # ---- mouse event reception ----
+            async def mouse_event(x: float, y: float, typ: str):
+                idx = self._mon_for(x, y, mons)
+                log.info(
+                    f"{typ:<6} @({x:7.1f},{y:7.1f}) → mon={idx}   {'(guarded)' if self._skip() else ''}"
+                )
+                if self._skip() or idx is None:
+                    return
+
+                # lazily grab before-frame
+                if self._pending_event is None:
+                    async with self._frame_lock:
+                        bf = self._frames.get(idx)
+                    if bf is None:
                         return
-                    frame = await asyncio.to_thread(sct_.grab, mons_[idx - 1])
-                    path = await self._save_frame(frame, "after")
-                    await self._log_event("frame", {"mon": idx, "path": path})
-                self._reset_timer("_shot_handle", self._FRAME_IDLE_SEC, take_shot)
+                    self._pending_event = {"type": typ, "mon": idx, "before": bf}
 
-            # ─── monitor-lookup utility ───
-            def _mon_for_local(x: float, y: float):
-                return self._mon_for(x, y, mons)
+                # reset debounce timer
+                if self._debounce_handle:
+                    self._debounce_handle.cancel()
+                self._debounce_handle = loop.call_later(DEBOUNCE, debounce_flush)
 
-            self._mon_for = _mon_for_local     # bind for inner coroutines
+            # ---- main capture loop ----
+            log.info(f"Screen observer started — guarding {self._guard or '∅'}")
+            last_periodic = time.time()
 
-            # ─── main capture loop ───
-            log.info("Screen observer started — guarding %s", self._guard or "∅")
-            while self._running:
+            while self._running:                         # flag from base class
                 t0 = time.time()
+
+                # refresh 'before' buffers
                 for idx, m in enumerate(mons, 1):
                     frame = await asyncio.to_thread(sct.grab, m)
                     async with self._frame_lock:
                         self._frames[idx] = frame
-                await asyncio.sleep(max(0, (1 / self._CAPTURE_FPS) - (time.time() - t0)))
 
-            # ─── shutdown ───
-            mouse_listener.stop()
-            keyboard_listener.stop()
-            for h in (self._move_handle, self._scroll_handle, self._shot_handle):
-                if h:
-                    h.cancel()
-            self._keys_fh.close()
+                # periodic snapshots
+                if not self._skip() and t0 - last_periodic >= PERIOD:
+                    last_periodic = t0
+                    for idx, m in enumerate(mons, 1):
+                        frame = await asyncio.to_thread(sct.grab, m)
+                        path  = await self._save_frame(frame, f"periodic_m{idx}")
+                        # only transcribe single periodic frame (no summary)
+                        try:
+                            txt = await self._call_gpt_vision(self.transcription_prompt, [path])
+                        except Exception as exc:      # pragma: no cover
+                            txt = f"[periodic transcription failed: {exc}]"
+                        await self.update_queue.put(Update(content=txt, content_type="input_text"))
+
+                # fps throttle
+                dt = time.time() - t0
+                await asyncio.sleep(max(0, (1 / CAP_FPS) - dt))
+
+            # shutdown
+            listener.stop()
+            if self._debounce_handle:
+                self._debounce_handle.cancel()
