@@ -99,6 +99,10 @@ class VideoScreen(Observer):
         )
         return path
 
+    @staticmethod
+    def _load_prompt(fname: str) -> str:
+        return get_package_file("gum.prompts.screen").joinpath(fname).read_text()
+
     async def _create_video_from_frames(self, paths: list[str]) -> str:
         """Build a silent MP4 using moviepy.  Runs in a worker thread."""
 
