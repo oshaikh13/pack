@@ -63,7 +63,7 @@ class VideoScreen(Observer):
         # guard list --------------------------------------------------------
         self._guard = {skip_when_visible} if isinstance(skip_when_visible, str) else set(skip_when_visible or [])
 
-        self.transcription_prompt = transcription_prompt
+        self.transcription_prompt = transcription_prompt or self._load_prompt("dense_caption.txt")
         self.debug = debug
 
         # shared state ------------------------------------------------------
@@ -149,6 +149,8 @@ class VideoScreen(Observer):
         video_path = await self._create_video_from_frames(paths)
         try:
             transcription = await self._call_gemini(self.transcription_prompt, video_path)
+            print("GEMINI CALLED")
+            print(transcription)
         except Exception as exc:  # pragma: no cover
             transcription = f"[Gemini call failed: {exc}]"
 
