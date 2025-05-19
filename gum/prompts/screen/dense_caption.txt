@@ -18,4 +18,4 @@ Use the following JSON format:
     ...
 ]
 
-Carefully analyze the entire provided video, isolate specific actions, and generate your result in the above format.
+Carefully analyze the entire provided video, isolate specific actions, and generate your result in the above format. Cover the ENTIRE video.

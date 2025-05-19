@@ -43,7 +43,7 @@ class VideoScreen(Observer):
     _DEBOUNCE_SEC: int = 1              # wait this long after an event
     _MON_START: int = 1                 # first real display in mss’ list
 
-    _SCREENSHOTS_PER_VIDEO: int = 30    # stitch when this many frames queued
+    _SCREENSHOTS_PER_VIDEO: int = 10    # stitch when this many frames queued
     _SECONDS_PER_SCREENSHOT: int = 1    # still frame duration inside clip
 
     # ----------------------------- construction -----------------------------
@@ -101,43 +101,81 @@ class VideoScreen(Observer):
 
     async def _create_video_from_frames(self, paths: list[str]) -> str:
         """Build a silent MP4 using moviepy.  Runs in a worker thread."""
-        async def _build() -> str:
+
+        def _build() -> str:
             clip = ImageSequenceClip(paths, fps=1 / self._SECONDS_PER_SCREENSHOT)
-            out  = os.path.join(self.screens_dir, f"{time.time():.5f}.mp4")
+            out = os.path.join(self.screens_dir, f"{time.time():.5f}.mp4")
             clip.write_videofile(out, codec="libx264", audio=False, logger=None)
             clip.close()
             return out
-
+        
+        # Offload the blocking MoviePy call into a real thread
         return await asyncio.to_thread(_build)
 
-    async def _call_gemini(self, prompt: str, video_path: str) -> str:
+    def _call_gemini(self, prompt: str, video_path: str) -> str:
         """Synchronous Google GenAI call wrapped in `to_thread`."""
+        print("CALLING GEMINI")
         def _sync_call() -> str:
-            generate_content_config = genai_types.GenerateContentConfig(
+            print("GENERATING CONFIG")
+            generate_content_config = genai.types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=genai_types.Schema(
-                    type=genai_types.Type.OBJECT,
-                    properties={
-                        "timestamp": genai_types.Schema(type=genai_types.Type.STRING),
-                        "caption":   genai_types.Schema(type=genai_types.Type.STRING),
+                response_schema=genai.types.Schema(
+                    type = genai.types.Type.OBJECT,
+                    required = ["transcriptions"],
+                    properties = {
+                        "transcriptions": genai.types.Schema(
+                            type = genai.types.Type.ARRAY,
+                            items = genai.types.Schema(
+                                type = genai.types.Type.OBJECT,
+                                required = ["caption", "timestamp"],
+                                properties = {
+                                    "caption": genai.types.Schema(
+                                        type = genai.types.Type.STRING,
+                                    ),
+                                    "timestamp": genai.types.Schema(
+                                        type = genai.types.Type.STRING,
+                                    ),
+                                },
+                            ),
+                        ),
                     },
                 ),
             )
-            client   = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
-            uploaded = client.files.upload(file=video_path)
+
+            client   = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+            with open(video_path, "rb") as f:
+                video_bytes = f.read()
 
             resp = client.models.generate_content(
                 model="gemini-2.0-flash",
-                contents=[uploaded, prompt],
+                contents=genai_types.Content(
+                    parts=[
+                        genai_types.Part(
+                            inline_data=genai_types.Blob(
+                                data=video_bytes,
+                                mime_type="video/mp4"
+                            )
+                        ),
+                        genai_types.Part(
+                            text=self.transcription_prompt
+                        ),
+                    ]
+                ),
                 config=generate_content_config,
             )
+
             return resp.text
 
-        return await asyncio.to_thread(_sync_call)
+        return _sync_call()
 
     # --------------------------- processing logic --------------------------
     async def _maybe_flush_video(self) -> None:
         """If enough screenshots are queued, build video → Gemini → emit Update."""
+
+        print("QUEUED PATHS")
+        print(f"{len(self._queued_paths)} / {self._SCREENSHOTS_PER_VIDEO}")
+
         if len(self._queued_paths) < self._SCREENSHOTS_PER_VIDEO:
             return
 
@@ -147,11 +185,14 @@ class VideoScreen(Observer):
         )
 
         video_path = await self._create_video_from_frames(paths)
+
+        print(video_path)
+
         try:
-            transcription = await self._call_gemini(self.transcription_prompt, video_path)
+            transcription = self._call_gemini(self.transcription_prompt, video_path)
             print("GEMINI CALLED")
             print(transcription)
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             transcription = f"[Gemini call failed: {exc}]"
 
         await self.update_queue.put(Update(content=transcription, content_type="input_text"))
