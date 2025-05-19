@@ -1,5 +1,5 @@
 from .observer import Observer
 from .screen import Screen
-from .frame_screen import FrameScreen
+from .video_screen import VideoScreen
 
-__all__ = ["Observer", "Screen", "FrameScreen"] 
+__all__ = ["Observer", "Screen", "VideoScreen"] 

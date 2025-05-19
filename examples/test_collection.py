@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import asyncio
-from gum.observers.frame_screen import FrameScreen
+from gum.observers.video_screen import VideoScreen
 
 async def main() -> None:
-    screen = FrameScreen(
-        screenshots_dir="~/.cache/gum/screens",
-        keystrokes_path="~/.cache/gum/keys.log",
+    screen = VideoScreen(
+        # screenshots_dir="~/.cache/gum/screens",
+        # keystrokes_path="~/.cache/gum/keys.log",
         debug=True                     # log to console
     )
 
