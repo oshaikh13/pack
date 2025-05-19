@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from typing import Any, Dict, Optional
+from importlib.resources import files as get_package_file
 
 # — Third‑party —
 import mss
@@ -39,6 +40,7 @@ class FrameScreen(Observer):
     _SCROLL_IDLE_SEC: float = 0.35    # idle gap ending a "scroll" gesture
     _FRAME_IDLE_SEC: float = 1.00     # idle gap before we snapshot screen
     _MON_START: int = 1               # first real display in mss.monitors
+    _VIDEO_CONSTRUCT_FPS: int = 1     # take each screenshot and turn it into a video with X FPS
 
     # ───────────────────────── construction
     def __init__(
@@ -78,6 +80,7 @@ class FrameScreen(Observer):
 
         # debounced screenshot handle
         self._shot_handle: Optional[asyncio.TimerHandle] = None
+        self._dense_caption_prompt = self._load_prompt("dense_caption.txt")
 
         super().__init__()
 
@@ -130,6 +133,10 @@ class FrameScreen(Observer):
             path = await self._save_frame(frame, "after")
             await self._log_event("frame", {"mon": idx, "path": path})
         self._reset_timer("_shot_handle", self._FRAME_IDLE_SEC, take_shot)
+
+    @staticmethod
+    def _load_prompt(fname: str) -> str:
+        return get_package_file("gum.prompts.screen").joinpath(fname).read_text()
 
     # ───────────────────────── main async worker
     async def _worker(self) -> None:

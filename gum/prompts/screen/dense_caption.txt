@@ -1,0 +1,21 @@
+Provide a detailed description of the user's actions across the provided video. 
+
+Include as much relevant detail as possible, but don't be verbose.
+
+To help, here are some keystrokes that lie within the video:
+---
+{keystrokes}
+---
+
+Since the actions may not be consecutive, use timestamps to denote the relevant intervals of the video.
+
+Use the following JSON format:
+[
+    {
+        "timestamp": "MM:SS-MM:SS, MM:SS-MM:SS,...",
+        "caption": "[concise 2-3 sentence description of the actions the user is taking across these frames]"
+    },
+    ...
+]
+
+Carefully analyze the entire provided video, isolate specific actions, and generate your result in the above format.
