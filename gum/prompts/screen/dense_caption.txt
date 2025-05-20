@@ -20,4 +20,4 @@ Use the following JSON format:
 
 Carefully analyze the entire provided video, isolate specific actions, and generate your result in the above format.
 
-The full video is {max_time} long, so make sure the intervals cover the ENTIRE video.
+The full video is {max_time} long, so make sure the intervals cover the ENTIRE video. Break the caption down by every change / action.

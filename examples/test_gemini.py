@@ -18,7 +18,7 @@ def _sync_call() -> str:
         ),
     )
 
-    video_path = "/Users/oshaikh/.cache/gum/screenshots/1747677377.89459.mp4"
+    video_path = "/Users/oshaikh/.cache/gum/screenshots/1747698197.60748.mp4"
     print("READING VIDEO INTO MEMORY")
     with open(video_path, "rb") as f:
         video_bytes = f.read()

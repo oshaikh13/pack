@@ -5,6 +5,7 @@ from __future__ import annotations
 
 # — Standard library —
 import asyncio
+import json
 import logging
 import os
 import time
@@ -15,7 +16,7 @@ from typing import Any, Dict, Optional
 # — Third‑party —
 import mss
 from PIL import Image
-from pynput import mouse
+from pynput import mouse, keyboard
 from moviepy import ImageSequenceClip
 from google import genai
 from google.genai import types as genai_types
@@ -34,6 +35,8 @@ class VideoScreen(Observer):
     """
     Capture before/after screenshots around user interactions, bundle them
     into short silent MP4 clips, and send the clip to Gemini for captioning.
+    Additionally, log *all* raw mouse and keyboard events to a newline‑
+    delimited JSON (JSONL) file for downstream analysis.
     Heavy CPU / blocking I/O work runs in background threads via
     `asyncio.to_thread`.
     """
@@ -43,16 +46,16 @@ class VideoScreen(Observer):
     _DEBOUNCE_SEC: int = 1              # wait this long after an event
     _MON_START: int = 1                 # first real display in mss' list
 
-    _SCREENSHOTS_PER_VIDEO: int = 10    # stitch when this many frames queued
+    _SCREENSHOTS_PER_VIDEO: int = 30    # stitch when this many frames queued
     _SECONDS_PER_SCREENSHOT: int = 1    # still frame duration inside clip
 
     # ----------------------------- construction -----------------------------
     def __init__(
         self,
         screenshots_dir: str = "~/.cache/gum/screenshots",
-        keystrokes_file: str = "~/.cache/gum/keystrokes.jsonl",
-        skip_when_visible: Optional[str | list[str]] = None,
-        transcription_prompt: str = None,
+        events_file: str = "~/.cache/gum/keystrokes.jsonl",
+        skip_when_visible: str | list[str] | None = None,
+        transcription_prompt: str | None = None,
         history_k: int = 10,
         debug: bool = False,
     ) -> None:
@@ -60,6 +63,12 @@ class VideoScreen(Observer):
         # output dir --------------------------------------------------------
         self.screens_dir = os.path.abspath(os.path.expanduser(screenshots_dir))
         os.makedirs(self.screens_dir, exist_ok=True)
+
+        # event log ---------------------------------------------------------
+        self.events_path = os.path.abspath(os.path.expanduser(events_file))
+        os.makedirs(os.path.dirname(self.events_path), exist_ok=True)
+        # lazy open — create empty file if missing so tail -f works straightaway
+        open(self.events_path, "a", encoding="utf‑8").close()
 
         # guard list --------------------------------------------------------
         self._guard = {skip_when_visible} if isinstance(skip_when_visible, str) else set(skip_when_visible or [])
@@ -86,6 +95,13 @@ class VideoScreen(Observer):
             if m["left"] <= x < m["left"] + m["width"] and m["top"] <= y < m["top"] + m["height"]:
                 return idx
         return None
+
+    # ----------------------------- event logger ---------------------------
+    async def _log_event(self, payload: dict) -> None:
+        await asyncio.to_thread(
+            lambda p: open(self.events_path, "a", encoding="utf‑8").write(json.dumps(p, ensure_ascii=False) + "\n"),
+            payload,
+        )
 
     # ----------------------------- I/O helpers -----------------------------
     async def _save_frame(self, frame, tag: str) -> str:
@@ -170,14 +186,16 @@ class VideoScreen(Observer):
             config=generate_content_config,
         )
 
+        print("CAPTIONING")
+        print(resp.text)
+
         return resp.text
 
     # --------------------------- processing logic --------------------------
     async def _maybe_flush_video(self) -> None:
         """If enough screenshots are queued, build video → Gemini → emit Update."""
 
-        print("QUEUED PATHS")
-        print(f"{len(self._queued_paths)} / {self._SCREENSHOTS_PER_VIDEO}")
+        print(len(self._queued_paths) , self._SCREENSHOTS_PER_VIDEO)
 
         if len(self._queued_paths) < self._SCREENSHOTS_PER_VIDEO:
             return
@@ -189,12 +207,8 @@ class VideoScreen(Observer):
 
         video_path = await self._create_video_from_frames(paths)
 
-        print(video_path)
-
         try:
             transcription = self._call_gemini(self.transcription_prompt, video_path)
-            print("GEMINI CALLED")
-            print(transcription)
         except Exception as exc:
             transcription = f"[Gemini call failed: {exc}]"
 
@@ -234,15 +248,22 @@ class VideoScreen(Observer):
             mons = sct.monitors[self._MON_START:]
 
             # ---- mouse callbacks (pynput is sync → schedule into loop) ----
-            def schedule_event(x: float, y: float, typ: str):
-                asyncio.run_coroutine_threadsafe(mouse_event(x, y, typ), loop)
+            def schedule_mouse_event(x: float, y: float, typ: str, **extra):
+                asyncio.run_coroutine_threadsafe(mouse_event(x, y, typ, **extra), loop)
 
-            listener = mouse.Listener(
-                on_move=lambda x, y: schedule_event(x, y, "move"),
-                on_click=lambda x, y, btn, prs: schedule_event(x, y, "click") if prs else None,
-                on_scroll=lambda x, y, dx, dy: schedule_event(x, y, "scroll"),
+            mouse_listener = mouse.Listener(
+                on_move=lambda x, y: schedule_mouse_event(x, y, "move"),
+                on_click=lambda x, y, btn, prs: schedule_mouse_event(x, y, "click", button=str(btn), pressed=prs),
+                on_scroll=lambda x, y, dx, dy: schedule_mouse_event(x, y, "scroll", dx=dx, dy=dy),
             )
-            listener.start()
+            mouse_listener.start()
+
+            # ---- keyboard callbacks (pynput) ----
+            def schedule_key_event(k):
+                asyncio.run_coroutine_threadsafe(key_event(k), loop)
+
+            keyboard_listener = keyboard.Listener(on_press=schedule_key_event)
+            keyboard_listener.start()
 
             # ---- nested helper inside the async context ----
             async def flush():
@@ -267,15 +288,22 @@ class VideoScreen(Observer):
                 asyncio.create_task(flush())
 
             # ---- mouse event reception ----
-            async def mouse_event(x: float, y: float, typ: str):
+            async def mouse_event(x: float, y: float, typ: str, **kw):
                 idx = self._mon_for(x, y, mons)
-                log.info(
-                    f"{typ:<6} @({x:7.1f},{y:7.1f}) → mon={idx}   {'(guarded)' if self._skip() else ''}"
-                )
                 if self._skip() or idx is None:
                     return
 
-                # lazily grab before-frame
+                # immediately log raw event -------------------------------
+                await self._log_event({
+                    "ts": time.time(),
+                    "device": "mouse",
+                    "type": typ,
+                    "x": x,
+                    "y": y,
+                    **kw,
+                })
+
+                # lazily grab before-frame -------------------------------
                 if self._pending_event is None:
                     async with self._frame_lock:
                         bf = self._frames.get(idx)
@@ -283,10 +311,25 @@ class VideoScreen(Observer):
                         return
                     self._pending_event = {"type": typ, "mon": idx, "before": bf}
 
-                # reset debounce timer
+                # reset debounce timer -----------------------------------
                 if self._debounce_handle:
                     self._debounce_handle.cancel()
                 self._debounce_handle = loop.call_later(DEBOUNCE, debounce_flush)
+
+            # ---- keyboard event reception ----
+            async def key_event(k):
+                # translate key into printable / name
+                try:
+                    key_repr = k.char if hasattr(k, "char") and k.char else str(k)
+                except AttributeError:
+                    key_repr = str(k)
+
+                await self._log_event({
+                    "ts": time.time(),
+                    "device": "keyboard",
+                    "type": "press",
+                    "key": key_repr,
+                })
 
             # ---- main capture loop ----
             log.info(f"Screen observer started — guarding {self._guard or '∅'}")
@@ -304,7 +347,8 @@ class VideoScreen(Observer):
                 dt = time.time() - t0
                 await asyncio.sleep(max(0, (1 / CAP_FPS) - dt))
 
-            # shutdown
-            listener.stop()
+            # shutdown ----------------------------------------------------
+            mouse_listener.stop()
+            keyboard_listener.stop()
             if self._debounce_handle:
                 self._debounce_handle.cancel()
