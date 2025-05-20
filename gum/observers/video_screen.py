@@ -259,10 +259,13 @@ class VideoScreen(Observer):
             mouse_listener.start()
 
             # ---- keyboard callbacks (pynput) ----
-            def schedule_key_event(k):
-                asyncio.run_coroutine_threadsafe(key_event(k), loop)
+            def schedule_key_event(k, event_type="press"): # Add event_type
+                asyncio.run_coroutine_threadsafe(key_event(k, event_type), loop) # Pass event_type
 
-            keyboard_listener = keyboard.Listener(on_press=schedule_key_event)
+            keyboard_listener = keyboard.Listener(
+                on_press=lambda k: schedule_key_event(k, "press"),
+                on_release=lambda k: schedule_key_event(k, "release") # Add this
+            )
             keyboard_listener.start()
 
             # ---- nested helper inside the async context ----
@@ -317,17 +320,17 @@ class VideoScreen(Observer):
                 self._debounce_handle = loop.call_later(DEBOUNCE, debounce_flush)
 
             # ---- keyboard event reception ----
-            async def key_event(k):
+            async def key_event(k, event_type: str): # Add event_type
                 # translate key into printable / name
                 try:
                     key_repr = k.char if hasattr(k, "char") and k.char else str(k)
-                except AttributeError:
+                except AttributeError: # Should not happen with pynput keys, but good practice
                     key_repr = str(k)
 
                 await self._log_event({
                     "ts": time.time(),
                     "device": "keyboard",
-                    "type": "press",
+                    "type": event_type, # Use the passed event_type
                     "key": key_repr,
                 })
 
