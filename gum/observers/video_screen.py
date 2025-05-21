@@ -28,18 +28,10 @@ from ..schemas import Update
 from .window_geometry import is_app_visible as _is_app_visible
 
 ###############################################################################
-# Screen observer powered by Gemini                                           #
+# Screen observer                                                             #
 ###############################################################################
 
 class VideoScreen(Observer):
-    """
-    Capture before/after screenshots around user interactions, bundle them
-    into short silent MP4 clips, and send the clip to Gemini for captioning.
-    Additionally, log *all* raw mouse and keyboard events to a newline‑
-    delimited JSON (JSONL) file for downstream analysis.
-    Heavy CPU / blocking I/O work runs in background threads via
-    `asyncio.to_thread`.
-    """
 
     # ----------------------------- tuning knobs -----------------------------
     _CAPTURE_FPS: int = 10              # live "before-frame" refresh rate
@@ -167,6 +159,21 @@ class VideoScreen(Observer):
         minutes = total_seconds // 60
         seconds = total_seconds % 60
         curr_prompt = prompt.replace("{max_time}", f"{minutes:02d}:{seconds:02d}")
+
+        timestamped_keystrokes = None
+
+        # from the keystrokes jsonl file, we need to pick out the keystrokes that occur IN the video
+        # then we need to convert that into a MM:SS format (no decimals, just bucket into seconds)
+        # something like:
+        # MM:SS
+        # [keystroke event]...
+        # [keystroke event]
+        # MM:SS + 1
+        # ...
+        # but start from 0 because the video starts from 0. and you need to make sure it's frame aligned.
+
+        curr_prompt = curr_prompt.replace("{keystrokes}", timestamped_keystrokes)
+
 
         resp = client.models.generate_content(
             model="gemini-2.0-flash",
