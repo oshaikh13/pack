@@ -1,4 +1,5 @@
 from __future__ import annotations
+import pdb
 ###############################################################################
 # Imports                                                                     #
 ###############################################################################
@@ -26,6 +27,7 @@ from .observer import Observer
 from ..schemas import Update
 
 from .window_geometry import is_app_visible as _is_app_visible
+from .keyboard_compressor import EventCompressor
 
 ###############################################################################
 # Screen observer                                                             #
@@ -38,7 +40,7 @@ class VideoScreen(Observer):
     _DEBOUNCE_SEC: int = 1              # wait this long after an event
     _MON_START: int = 1                 # first real display in mss' list
 
-    _SCREENSHOTS_PER_VIDEO: int = 30    # stitch when this many frames queued
+    _SCREENSHOTS_PER_VIDEO: int = 10    # stitch when this many frames queued
     _SECONDS_PER_SCREENSHOT: int = 1    # still frame duration inside clip
 
     # ----------------------------- construction -----------------------------
@@ -72,6 +74,8 @@ class VideoScreen(Observer):
         self._frame_lock = asyncio.Lock()
 
         self._queued_paths: list[str] = []
+        self._queued_paths_lock = asyncio.Lock() # <<< MINIMAL CHANGE: ADD THIS LINE
+
         self._history: deque[str] = deque(maxlen=max(0, history_k))
 
         self._pending_event: Optional[dict] = None
@@ -124,25 +128,22 @@ class VideoScreen(Observer):
         # Offload the blocking MoviePy call into a real thread
         return await asyncio.to_thread(_build)
 
-    def _call_gemini(self, prompt: str, video_path: str) -> str:
+    async def _call_gemini(self, prompt: str, video_path: str, video_frame_paths: list[str]) -> str:
+        # Gemini client and config setup (remains the same)
         generate_content_config = genai.types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=genai.types.Schema(
-                type = genai.types.Type.OBJECT,
-                required = ["transcriptions"],
-                properties = {
+                type=genai.types.Type.OBJECT,
+                required=["transcriptions"],
+                properties={
                     "transcriptions": genai.types.Schema(
-                        type = genai.types.Type.ARRAY,
-                        items = genai.types.Schema(
-                            type = genai.types.Type.OBJECT,
-                            required = ["caption", "timestamp"],
-                            properties = {
-                                "caption": genai.types.Schema(
-                                    type = genai.types.Type.STRING,
-                                ),
-                                "timestamp": genai.types.Schema(
-                                    type = genai.types.Type.STRING,
-                                ),
+                        type=genai.types.Type.ARRAY,
+                        items=genai.types.Schema(
+                            type=genai.types.Type.OBJECT,
+                            required=["caption", "timestamp"],
+                            properties={
+                                "caption": genai.types.Schema(type=genai.types.Type.STRING),
+                                "timestamp": genai.types.Schema(type=genai.types.Type.STRING),
                             },
                         ),
                     ),
@@ -150,75 +151,99 @@ class VideoScreen(Observer):
             ),
         )
 
-        client   = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        # Ensure API key is available
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            logging.error("GEMINI_API_KEY environment variable not set.")
+            return "[Error: GEMINI_API_KEY not set]"
+        client = genai.Client(api_key=api_key)
+
+        print(video_path)
 
         with open(video_path, "rb") as f:
             video_bytes = f.read()
 
-        total_seconds = self._SCREENSHOTS_PER_VIDEO * self._SECONDS_PER_SCREENSHOT
-        minutes = total_seconds // 60
-        seconds = total_seconds % 60
+        # Prepare {max_time} for the prompt
+        total_seconds_in_video = self._SCREENSHOTS_PER_VIDEO * self._SECONDS_PER_SCREENSHOT
+        minutes = total_seconds_in_video // 60
+        seconds = total_seconds_in_video % 60
         curr_prompt = prompt.replace("{max_time}", f"{minutes:02d}:{seconds:02d}")
 
-        timestamped_keystrokes = None
+        # --- Logic for timestamped_keystrokes ---
+        first_frame_filename = os.path.basename(video_frame_paths[0])
+        
+        # Extract timestamp from filename (e.g., "1678886400.12345_before.jpg")
+        video_start_ts_str = first_frame_filename.split("_")[0]
+        video_start_ts = float(video_start_ts_str)
 
-        # from the keystrokes jsonl file, we need to pick out the keystrokes that occur IN the video
-        # then we need to convert that into a MM:SS format (no decimals, just bucket into seconds)
-        # something like:
-        # MM:SS
-        # [keystroke event]...
-        # [keystroke event]
-        # MM:SS + 1
-        # ...
-        # but start from 0 because the video starts from 0. and you need to make sure it's frame aligned.
+        # Video duration in integer seconds
+        video_duration_total_seconds = self._SCREENSHOTS_PER_VIDEO * self._SECONDS_PER_SCREENSHOT
+        video_end_ts = video_start_ts + video_duration_total_seconds
 
-        curr_prompt = curr_prompt.replace("{keystrokes}", timestamped_keystrokes)
+        relevant_events_for_formatting = [] # To store dicts: {relative_ts_seconds, description, original_ts}
+            
+        with open(self.events_path, "r", encoding="utf-8") as f_events:
+            for line_number, line in enumerate(f_events, 1):
+                event = json.loads(line)
+                event_ts = event.get("ts")
+                # Filter for keyboard events within the video's absolute time range
+                if video_start_ts <= event_ts < video_end_ts:
+                    relevant_events_for_formatting.append(event)
 
+        curr_compress = EventCompressor(relevant_events_for_formatting)
+        curr_compress.process_all()  
 
-        resp = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=genai_types.Content(
-                parts=[
-                    genai_types.Part(
-                        inline_data=genai_types.Blob(
-                            data=video_bytes,
-                            mime_type="video/mp4"
-                        )
-                    ),
-                    genai_types.Part(
-                        text=curr_prompt
-                    ),
-                ]
-            ),
-            config=generate_content_config,
-        )
+        # ------------------------------------------------------------------
+        # Build the {timestamped_keystrokes} section for the prompt
+        # ------------------------------------------------------------------
+        # curr_prompt = curr_prompt.replace("{keystrokes}", None)
 
-        print("CAPTIONING")
-        print(resp.text)
-
-        return resp.text
+        # Gemini API call (remains the same)
+        try:
+            resp = await client.aio.models.generate_content(
+                model="gemini-2.0-flash", # Consider making model configurable
+                contents=genai_types.Content(
+                    parts=[
+                        genai_types.Part(
+                            inline_data=genai_types.Blob(
+                                data=video_bytes,
+                                mime_type="video/mp4"
+                            )
+                        ),
+                        genai_types.Part(
+                            text=curr_prompt
+                        ),
+                    ]
+                ),
+                config=generate_content_config, # Renamed from config to generation_config
+            )
+            print("CAPTIONING") # Original print statement
+            print(resp.text) # Original print statement
+            if self.debug:
+                logging.getLogger("Screen.GeminiCall").info(f"Gemini response text: {resp.text}")
+            return resp.text
+        except Exception as e:
+            logging.error(f"Gemini API call failed: {e}")
+            return f"[Gemini API Error: {e}]"
 
     # --------------------------- processing logic --------------------------
     async def _maybe_flush_video(self) -> None:
         """If enough screenshots are queued, build video → Gemini → emit Update."""
 
-        print(len(self._queued_paths) , self._SCREENSHOTS_PER_VIDEO)
+        print(len(self._queued_paths) , self._SCREENSHOTS_PER_VIDEO) # Original print, can stay
 
-        if len(self._queued_paths) < self._SCREENSHOTS_PER_VIDEO:
+        paths_to_process_this_run: Optional[list[str]] = None 
+
+        async with self._queued_paths_lock: # <<< MINIMAL CHANGE: ACQUIRE LOCK
+            if len(self._queued_paths) >= self._SCREENSHOTS_PER_VIDEO:
+                paths_to_process_this_run = self._queued_paths[: self._SCREENSHOTS_PER_VIDEO]
+                self._queued_paths = self._queued_paths[self._SCREENSHOTS_PER_VIDEO :]
+
+        if paths_to_process_this_run is None: 
             return
 
-        paths, self._queued_paths = (
-            self._queued_paths[: self._SCREENSHOTS_PER_VIDEO],
-            self._queued_paths[self._SCREENSHOTS_PER_VIDEO :],
-        )
-
-        video_path = await self._create_video_from_frames(paths)
-
-        try:
-            transcription = self._call_gemini(self.transcription_prompt, video_path)
-        except Exception as exc:
-            transcription = f"[Gemini call failed: {exc}]"
-
+        video_path = await self._create_video_from_frames(paths_to_process_this_run)
+        transcription = await self._call_gemini(self.transcription_prompt, video_path, paths_to_process_this_run)
         await self.update_queue.put(Update(content=transcription, content_type="input_text"))
 
     async def _process_event(self, before_path: str, after_path: str | None) -> None:
