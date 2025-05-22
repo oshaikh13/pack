@@ -1,5 +1,6 @@
 from __future__ import annotations
-import pdb
+from collections import deque
+
 ###############################################################################
 # Imports                                                                     #
 ###############################################################################
@@ -59,10 +60,7 @@ class VideoScreen(Observer):
         os.makedirs(self.screens_dir, exist_ok=True)
 
         # event log ---------------------------------------------------------
-        self.events_path = os.path.abspath(os.path.expanduser(events_file))
-        os.makedirs(os.path.dirname(self.events_path), exist_ok=True)
-        # lazy open — create empty file if missing so tail -f works straightaway
-        open(self.events_path, "a", encoding="utf‑8").close()
+        self._event_deque: deque[dict] = deque()
 
         # guard list --------------------------------------------------------
         self._guard = {skip_when_visible} if isinstance(skip_when_visible, str) else set(skip_when_visible or [])
@@ -97,10 +95,7 @@ class VideoScreen(Observer):
 
     # ----------------------------- event logger ---------------------------
     async def _log_event(self, payload: dict) -> None:
-        await asyncio.to_thread(
-            lambda p: open(self.events_path, "a", encoding="utf‑8").write(json.dumps(p, ensure_ascii=False) + "\n"),
-            payload,
-        )
+        self._event_deque.append(payload)
 
     # ----------------------------- I/O helpers -----------------------------
     async def _save_frame(self, frame, tag: str) -> str:
@@ -131,7 +126,7 @@ class VideoScreen(Observer):
         # Offload the blocking MoviePy call into a real thread
         return await asyncio.to_thread(_build)
 
-    async def _call_gemini(self, prompt: str, video_path: str, video_frame_paths: list[str]) -> str:
+    async def _call_gemini(self, prompt: str, video_path: str, video_frame_paths: list[str], relevant_events: list[dict]) -> str:
         # Gemini client and config setup (remains the same)
         generate_content_config = genai.types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -172,30 +167,10 @@ class VideoScreen(Observer):
         seconds = total_seconds_in_video % 60
         curr_prompt = prompt.replace("{max_time}", f"{minutes:02d}:{seconds:02d}")
 
-        # --- Logic for timestamped_keystrokes ---
-        first_frame_filename = os.path.basename(video_frame_paths[0])
-        
-        # Extract timestamp from filename (e.g., "1678886400.12345_before.jpg")
-        video_start_ts_str = first_frame_filename.split("_")[0]
-        video_start_ts = float(video_start_ts_str)
-
-        # Video duration in integer seconds
-        video_duration_total_seconds = self._SCREENSHOTS_PER_VIDEO * self._SECONDS_PER_SCREENSHOT
-        video_end_ts = video_start_ts + video_duration_total_seconds
-
-        relevant_events_for_formatting = [] # To store dicts: {relative_ts_seconds, description, original_ts}
-            
-        with open(self.events_path, "r", encoding="utf-8") as f_events:
-            for line_number, line in enumerate(f_events, 1):
-                event = json.loads(line)
-                event_ts = event.get("ts")
-                # Filter for keyboard events within the video's absolute time range
-                if video_start_ts <= event_ts < video_end_ts:
-                    relevant_events_for_formatting.append(event)
-
-        curr_compress = EventCompressor(relevant_events_for_formatting)
+        curr_compress = EventCompressor(relevant_events)
         curr_compress.process_all()  
 
+        print(curr_compress.compressed)
 
         # Gemini API call (remains the same)
         try:
@@ -264,7 +239,25 @@ class VideoScreen(Observer):
                 batch, buffer = buffer[:self._SCREENSHOTS_PER_VIDEO], buffer[self._SCREENSHOTS_PER_VIDEO:]
                 # offload the blocking MoviePy call
                 video_path = await asyncio.to_thread(self._build_video, batch)
-                transcription = await self._call_gemini(self.transcription_prompt, video_path, batch)
+
+                start_ts = float(os.path.basename(batch[0]).split("_")[0])
+                end_ts = start_ts + (self._SCREENSHOTS_PER_VIDEO * self._SECONDS_PER_SCREENSHOT)
+
+                while self._event_deque and self._event_deque[0]["ts"] < start_ts:
+                    self._event_deque.popleft()
+
+                relevant_events: list[dict] = []
+                while self._event_deque and self._event_deque[0]["ts"] < end_ts:
+                    relevant_events.append(self._event_deque.popleft())
+                
+                keystroke_path = video_path.replace(".mp4", ".jsonl")
+                with open(keystroke_path, "w", encoding="utf-8") as f:
+                    for ev in relevant_events:
+                        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+                transcription = await self._call_gemini(
+                    self.transcription_prompt, video_path, batch, relevant_events
+                )
                 await self.update_queue.put(Update(content=transcription, content_type="input_text"))
 
     # ----------------------------- skip guard -----------------------------
@@ -324,7 +317,7 @@ class VideoScreen(Observer):
                 aft = await asyncio.to_thread(sct.grab, mons[ev["mon"] - 1])
 
                 bef_path = await self._save_frame(ev["before"], "before")
-                aft_path = await self._save_frame(aft,          "after")
+                aft_path = await self._save_frame(aft, "after")
 
                 await self._process_event(bef_path, aft_path)
 
