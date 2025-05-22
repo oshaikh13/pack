@@ -73,10 +73,13 @@ class VideoScreen(Observer):
         self._frames: Dict[int, Any] = {}
         self._frame_lock = asyncio.Lock()
 
-        self._queued_paths: list[str] = []
-        self._queued_paths_lock = asyncio.Lock() # <<< MINIMAL CHANGE: ADD THIS LINE
+
 
         self._history: deque[str] = deque(maxlen=max(0, history_k))
+        # a queue to hold screenshot paths for video‐building
+        self._video_queue: asyncio.Queue[str] = asyncio.Queue()
+        # start the background consumer
+        self._video_worker = asyncio.create_task(self._video_consumer())
 
         self._pending_event: Optional[dict] = None
         self._debounce_handle: Optional[asyncio.TimerHandle] = None
@@ -193,10 +196,6 @@ class VideoScreen(Observer):
         curr_compress = EventCompressor(relevant_events_for_formatting)
         curr_compress.process_all()  
 
-        # ------------------------------------------------------------------
-        # Build the {timestamped_keystrokes} section for the prompt
-        # ------------------------------------------------------------------
-        # curr_prompt = curr_prompt.replace("{keystrokes}", None)
 
         # Gemini API call (remains the same)
         try:
@@ -226,34 +225,47 @@ class VideoScreen(Observer):
             logging.error(f"Gemini API call failed: {e}")
             return f"[Gemini API Error: {e}]"
 
-    # --------------------------- processing logic --------------------------
-    async def _maybe_flush_video(self) -> None:
-        """If enough screenshots are queued, build video → Gemini → emit Update."""
-
-        print(len(self._queued_paths) , self._SCREENSHOTS_PER_VIDEO) # Original print, can stay
-
-        paths_to_process_this_run: Optional[list[str]] = None 
-
-        async with self._queued_paths_lock: # <<< MINIMAL CHANGE: ACQUIRE LOCK
-            if len(self._queued_paths) >= self._SCREENSHOTS_PER_VIDEO:
-                paths_to_process_this_run = self._queued_paths[: self._SCREENSHOTS_PER_VIDEO]
-                self._queued_paths = self._queued_paths[self._SCREENSHOTS_PER_VIDEO :]
-
-        if paths_to_process_this_run is None: 
-            return
-
-        video_path = await self._create_video_from_frames(paths_to_process_this_run)
-        transcription = await self._call_gemini(self.transcription_prompt, video_path, paths_to_process_this_run)
-        await self.update_queue.put(Update(content=transcription, content_type="input_text"))
 
     async def _process_event(self, before_path: str, after_path: str | None) -> None:
         """Store screenshot paths and maybe trigger video flush."""
         self._history.append(before_path)
-        self._queued_paths.append(before_path)
+        # PUSH into our queue instead of juggling a list/lock:
+        await self._video_queue.put(before_path)
         if after_path:
-            self._queued_paths.append(after_path)
+            await self._video_queue.put(after_path)
 
-        await self._maybe_flush_video()
+    def _build_video(self, paths: list[str]) -> str:
+        """
+        Synchronous helper to stitch JPEGs into an MP4. Safe to run
+        in a Thread via asyncio.to_thread.
+        """
+        clip = ImageSequenceClip(paths, fps=1 / self._SECONDS_PER_SCREENSHOT)
+        out = os.path.join(self.screens_dir, f"{time.time():.5f}.mp4")
+        clip.write_videofile(out, codec="libx264", audio=False, logger=None)
+        clip.close()
+        return out
+
+
+    async def _video_consumer(self) -> None:
+        """
+        Pulls paths off self._video_queue, batches them in groups of
+        SCREENSHOTS_PER_VIDEO, builds one MP4 per batch, and sends to Gemini.
+        """
+        buffer: list[str] = []
+        # Keep running while Observer is alive or items remain
+        while self._running or not self._video_queue.empty():
+            path = await self._video_queue.get()
+            buffer.append(path)
+
+            print(len(buffer))
+
+            # Once we have enough frames, build+send
+            if len(buffer) >= self._SCREENSHOTS_PER_VIDEO:
+                batch, buffer = buffer[:self._SCREENSHOTS_PER_VIDEO], buffer[self._SCREENSHOTS_PER_VIDEO:]
+                # offload the blocking MoviePy call
+                video_path = await asyncio.to_thread(self._build_video, batch)
+                transcription = await self._call_gemini(self.transcription_prompt, video_path, batch)
+                await self.update_queue.put(Update(content=transcription, content_type="input_text"))
 
     # ----------------------------- skip guard -----------------------------
     def _skip(self) -> bool:
@@ -387,3 +399,7 @@ class VideoScreen(Observer):
             keyboard_listener.stop()
             if self._debounce_handle:
                 self._debounce_handle.cancel()
+
+            if self._video_worker:
+                self._video_worker.cancel()
+
